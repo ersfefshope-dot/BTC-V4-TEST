@@ -4,11 +4,15 @@
   "equity": 100000.0,
   "peak_equity": 100000.0,
   "position": null,
-  "last_bar_time": null,
+  "last_bar_time": "2026-11-22T00:00:00+00:00",
   "trades": [],
   "equity_history": [
     {
       "time": "2026-11-21T13:58:49.334301+00:00",
+      "equity": 100000.0
+    },
+    {
+      "time": "2026-11-22T04:01:45.620487+00:00",
       "equity": 100000.0
     }
   ]
