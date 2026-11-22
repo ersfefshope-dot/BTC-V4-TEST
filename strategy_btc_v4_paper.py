@@ -1,10 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 BTC/USDT 单币防过拟合 4H v4 云端模拟盘 (SUB-B 同款 GitHub Actions + Pages)
-已内置全球无地区限制多行情源自动容灾 (解决 GitHub Actions 美国服务器 451 限制):
-1. 主源: Binance 官方全球行情节点 data-api.binance.vision (含原生主动买入成交量，无 451 封锁)
-2. 备源1: OKX 永续合约公开接口 (BTC-USDT-SWAP 4H K线 + 资金费率历史)
-3. 备源2: Kraken 美国本土公开接口 (XBTUSD 4H K线，单次 720 根)
+已内置全球无地区限制三源容灾 + 8h 资金费率结算 + 实时盯市净值(MTM) + 无伪造备源字段
 """
 import json
 from datetime import datetime, timezone
@@ -73,8 +70,7 @@ def _fetch_okx_swap_4h(limit=600) -> pd.DataFrame:
     df["timestamp"] = pd.to_datetime(df["ts"].astype("int64"), unit="ms", utc=True)
     for c in ["open", "high", "low", "close", "volume"]:
         df[c] = pd.to_numeric(df[c], errors="coerce")
-    # 阳线近似估算主动买盘比例用于备源容灾
-    df["taker_buy_volume"] = df["volume"] * np.where(df["close"] >= df["open"], 0.55, 0.45)
+    df["taker_buy_volume"] = np.nan  # 备源无主动买盘字段，显式置 NaN 绝不伪造
     return df.drop_duplicates("timestamp").set_index("timestamp").sort_index().tail(limit)[["open", "high", "low", "close", "volume", "taker_buy_volume"]]
 
 
@@ -88,12 +84,12 @@ def _fetch_kraken_4h() -> pd.DataFrame:
     df["timestamp"] = pd.to_datetime(df["ts"].astype("int64"), unit="s", utc=True)
     for c in ["open", "high", "low", "close", "volume"]:
         df[c] = pd.to_numeric(df[c], errors="coerce")
-    df["taker_buy_volume"] = df["volume"] * np.where(df["close"] >= df["open"], 0.55, 0.45)
+    df["taker_buy_volume"] = np.nan  # 备源无主动买盘字段，显式置 NaN 绝不伪造
     return df.set_index("timestamp").sort_index()[["open", "high", "low", "close", "volume", "taker_buy_volume"]]
 
 
 def _fetch_funding_series(index: pd.DatetimeIndex) -> pd.Series:
-    """优先从 OKX 永续拉取 8h 资金费率历史 (无美国 IP 限制)，失败则回退中性费率"""
+    """优先从 OKX 永续拉取 8h 资金费率历史，失败则回退中性 0.0"""
     try:
         r = requests.get(
             "https://www.okx.com/api/v5/public/funding-rate-history",
@@ -105,10 +101,10 @@ def _fetch_funding_series(index: pd.DatetimeIndex) -> pd.Series:
             fdf = pd.DataFrame(r.json()["data"])
             fdf["ts"] = pd.to_datetime(fdf["fundingTime"].astype("int64"), unit="ms", utc=True)
             s = pd.to_numeric(fdf.set_index("ts")["fundingRate"], errors="coerce").sort_index()
-            return s.reindex(index, method="ffill").fillna(0.0001)
+            return s.reindex(index, method="ffill").fillna(0.0)
     except Exception:
         pass
-    return pd.Series(0.0001, index=index, dtype=float)
+    return pd.Series(0.0, index=index, dtype=float)
 
 
 def fetch_live_4h(limit=600) -> tuple[pd.DataFrame, str]:
@@ -145,24 +141,29 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
     df["taker_buy_ratio"] = df["taker_buy_volume"] / (df["volume"] + 1e-12)
     fm = df["funding_rate"].rolling(180, min_periods=30).mean()
     fs = df["funding_rate"].rolling(180, min_periods=30).std() + 1e-8
-    df["funding_z"] = ((df["funding_rate"] - fm) / fs).clip(-5, 5)
+    df["funding_z"] = ((df["funding_rate"] - fm) / fs).clip(-5, 5).fillna(0.0)
     d1 = df[["open", "high", "low", "close"]].resample("1D").agg({"open": "first", "high": "max", "low": "min", "close": "last"}).dropna()
     d1["ma20"], d1["ma60"] = d1["close"].rolling(20).mean(), d1["close"].rolling(60).mean()
     d1["regime_1d"] = np.where((d1["close"] > d1["ma60"]) & (d1["ma20"] > d1["ma60"]), 1, np.where((d1["close"] < d1["ma60"]) & (d1["ma20"] < d1["ma60"]), -1, 0))
     df["regime_1d"] = d1["regime_1d"].shift(1).reindex(df.index, method="ffill")
-    return df.dropna()
+    # 仅对核心列 dropna，避免备源 taker_buy_ratio=NaN 误删最新 K 线
+    core_cols = ["open", "high", "low", "close", "ema_120", "donchian_h_45", "regime_1d", "rvol_30", "atr_14"]
+    return df.dropna(subset=core_cols)
 
 
-def render_html(state, last_px, sig, regime, a, source_name):
+def render_html(state, equity_mark, unrealized, last_px, sig, regime, a, source_name):
     trades = state.get("trades", [])
     nt = len(trades)
     wr = (sum(1 for t in trades if t["net_pnl"] > 0) / nt * 100.0) if nt else 0.0
-    eq = state["equity"]
-    ret = (eq / state["initial_capital"] - 1.0) * 100.0
-    dd = (eq / max(state["peak_equity"], 1.0) - 1.0) * 100.0
+    ret = (equity_mark / state["initial_capital"] - 1.0) * 100.0
+    dd = (equity_mark / max(state["peak_equity"], 1.0) - 1.0) * 100.0
     reg_txt = "🟢 牛市体制 (做多开启)" if regime == 1 else ("🔴 熊市体制 (空仓防守)" if regime == -1 else "🟡 震荡过渡 (强制空仓)")
     pos = state.get("position")
-    pos_txt = "空仓观望 (FLAT)" if not pos else f"{pos['side']} {pos['qty']:.4f} BTC @ ${pos['entry_px']:,.2f} | 止损/吊灯 ${pos['sl_px']:,.1f}"
+    pos_txt = (
+        "空仓观望 (FLAT)"
+        if not pos
+        else f"{pos['side']} {pos['qty']:.4f} BTC @ ${pos['entry_px']:,.2f} | 浮盈亏 {unrealized:+,.2f}$ | 止损/吊灯 ${pos['sl_px']:,.1f}"
+    )
     rows = "".join(
         f"<tr><td>{t['exit_time'][:16]}</td><td>{t['side']}</td><td>${t['entry_px']:,.1f}</td><td>${t['exit_px']:,.1f}</td>"
         f"<td style='color:{'#10b981' if t['net_pnl']>0 else '#ef4444'}'>{t['net_pnl']:+,.2f}</td><td>{t['exit_reason']}</td></tr>"
@@ -181,10 +182,10 @@ table{{width:100%;border-collapse:collapse;font-size:13px;}} th,td{{padding:8px 
 <h2 style="margin:0 0 6px 0;">🛡️ BTC/USDT 单币防过拟合 v4 模拟盘</h2>
 <div style="font-size:12px;color:#94a3b8;margin-bottom:14px;">启动日: {state['live_start']} | 更新(UTC): {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')} | BTC现价: ${last_px:,.2f} | 数据源: {source_name}</div>
 <div class="grid">
-  <div class="card"><div class="lbl">模拟盘净值</div><div class="val">${eq:,.2f}</div></div>
+  <div class="card"><div class="lbl">盯市净值 (含浮盈亏)</div><div class="val">${equity_mark:,.2f}</div></div>
   <div class="card"><div class="lbl">累计收益率</div><div class="val" style="color:{'#10b981' if ret>=0 else '#ef4444'}">{ret:+.2f}%</div></div>
   <div class="card"><div class="lbl">实盘胜率 / 笔数</div><div class="val">{wr:.1f}% ({nt}笔)</div></div>
-  <div class="card"><div class="lbl">当前回撤 / 杠杆上限</div><div class="val">{dd:.2f}% / {a['max_leverage']}x</div></div>
+  <div class="card"><div class="lbl">实时回撤 / 杠杆上限</div><div class="val">{dd:.2f}% / {a['max_leverage']}x</div></div>
 </div>
 <div class="card"><div class="lbl">宏观体制与当前持仓</div><div style="font-size:14px;margin-top:6px;">{reg_txt} | 原型: {a['name']}</div>
 <div style="font-size:15px;font-weight:600;margin-top:6px;">{pos_txt}</div></div>
@@ -199,21 +200,32 @@ def main():
     state = json.loads((BASE_DIR / "paper_state.json").read_text(encoding="utf-8"))
     raw_df, source_name = fetch_live_4h(600)
     df = build_features(raw_df)
-    bar, bar_ts, last_px = df.iloc[-2], df.index[-2].isoformat(), float(df["close"].iloc[-1])
+    bar_idx = df.index[-2]
+    bar, bar_ts, last_px = df.iloc[-2], bar_idx.isoformat(), float(df["close"].iloc[-1])
+    is_new_bar = state.get("last_bar_time") != bar_ts
 
     regime = int(bar["regime_1d"])
     bull = (regime == 1) and (bar["close"] > bar["ema_120"])
     bear = (regime == -1) and (bar["close"] < bar["ema_120"])
+    tbr_ok = pd.isna(bar["taker_buy_ratio"]) or (bar["taker_buy_ratio"] > 0.505)
+
     l_sig = bull and bar["close"] > bar[f"donchian_h_{a['donchian_w']}"] and bar["vol_ratio"] >= 1.05 and bar["funding_z"] < 2.5
     if a["use_pullback"]:
-        l_sig = l_sig or (bull and bar["ema_50"] > bar["ema_120"] and bar["rsi_14"] <= 38.0 and bar["close"] > bar["open"] and bar["taker_buy_ratio"] > 0.505)
+        l_sig = l_sig or (bull and bar["ema_50"] > bar["ema_120"] and bar["rsi_14"] <= 38.0 and bar["close"] > bar["open"] and tbr_ok)
     s_sig = a["allow_short"] and bear and bar["close"] < bar[f"donchian_l_{a['donchian_w']}"] and bar["vol_ratio"] >= 1.05 and bar["funding_z"] > -2.5
     sig = 1 if (l_sig and not s_sig) else (-1 if (s_sig and not l_sig) else 0)
 
     pos = state.get("position")
     if pos is not None:
-        pos["bars_held"] = pos.get("bars_held", 0) + (1 if state.get("last_bar_time") != bar_ts else 0)
         si = 1 if pos["side"] == "LONG" else -1
+        if is_new_bar:
+            pos["bars_held"] = pos.get("bars_held", 0) + 1
+            # 1) 每 8 小时结算一次永续合约资金费率 (多头付正费率，空头收正费率)
+            if bar_idx.hour % 8 == 0:
+                f_pnl = -si * pos["qty"] * last_px * float(bar["funding_rate"])
+                state["equity"] += f_pnl
+                pos["funding_pnl"] = pos.get("funding_pnl", 0.0) + f_pnl
+
         er, epx = None, None
         if si == 1:
             pos["best_px"] = max(pos["best_px"], float(bar["high"]))
@@ -234,12 +246,12 @@ def main():
                 er, epx = "SHORT_TP", tp_s
             elif regime == 1:
                 er, epx = "REGIME_EXIT", last_px
-        if er is None and pos["bars_held"] >= 90 and si * (last_px - pos["entry_px"]) / pos["entry_px"] < 0.02:
+        if er is None and pos.get("bars_held", 0) >= 90 and si * (last_px - pos["entry_px"]) / pos["entry_px"] < 0.02:
             er, epx = "STAGNANT", last_px
         if er is not None:
             gross = si * (epx - pos["entry_px"]) * pos["qty"]
             fee = abs(pos["qty"] * epx) * ONE_WAY_COST
-            net = gross - fee - pos["entry_fee"]
+            net = gross - fee - pos["entry_fee"] + pos.get("funding_pnl", 0.0)
             state["equity"] += (gross - fee)
             state["peak_equity"] = max(state["peak_equity"], state["equity"])
             state["trades"].append({
@@ -249,8 +261,14 @@ def main():
             })
             state["position"] = None
 
-    tot_dd = (state["peak_equity"] - state["equity"]) / max(state["peak_equity"], 1.0)
-    if state.get("position") is None and state.get("last_bar_time") != bar_ts and sig != 0:
+    # 2) 计算实时盯市净值 (MTM) 并更新 peak_equity 与回撤
+    pos = state.get("position")
+    unrealized = ((1 if pos["side"] == "LONG" else -1) * (last_px - pos["entry_px"]) * pos["qty"]) if pos else 0.0
+    equity_mark = state["equity"] + unrealized
+    state["peak_equity"] = max(state["peak_equity"], equity_mark)
+    tot_dd = (state["peak_equity"] - equity_mark) / max(state["peak_equity"], 1.0)
+
+    if pos is None and is_new_bar and sig != 0:
         atr = float(bar["atr_14"])
         dd_s = 0.30 if tot_dd >= 0.13 else (0.60 if tot_dd >= 0.08 else 1.0)
         dir_s = 0.70 if sig == -1 else 1.0
@@ -264,15 +282,16 @@ def main():
         state["position"] = {
             "side": "LONG" if sig == 1 else "SHORT", "entry_time": datetime.now(timezone.utc).isoformat(),
             "entry_px": last_px, "best_px": last_px, "qty": qty, "entry_atr": atr, "entry_fee": ef,
-            "sl_px": last_px - sig * a["sl_atr"] * atr, "bars_held": 0,
+            "funding_pnl": 0.0, "sl_px": last_px - sig * a["sl_atr"] * atr, "bars_held": 0,
         }
+        equity_mark = state["equity"]
 
     state["last_bar_time"] = bar_ts
-    state["equity_history"].append({"time": datetime.now(timezone.utc).isoformat(), "equity": state["equity"]})
+    state["equity_history"].append({"time": datetime.now(timezone.utc).isoformat(), "equity": equity_mark})
     state["equity_history"] = state["equity_history"][-2000:]
-    render_html(state, last_px, sig, regime, a, source_name)
+    render_html(state, equity_mark, unrealized, last_px, sig, regime, a, source_name)
     (BASE_DIR / "paper_state.json").write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(f"[BTC v4 Paper Bot] 完成 | BTC=${last_px:,.2f} | Equity=${state['equity']:,.2f} | Regime={regime} | Sig={sig}")
+    print(f"[BTC v4 Paper Bot] 完成 | BTC=${last_px:,.2f} | MTM=${equity_mark:,.2f} | Regime={regime} | Sig={sig}")
 
 
 if __name__ == "__main__":
