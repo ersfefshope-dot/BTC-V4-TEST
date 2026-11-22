@@ -1,0 +1,27 @@
+{
+  "archetype": {
+    "name": "纯多+熊市空仓|突破+回调|DC30",
+    "donchian_w": 30,
+    "use_pullback": true,
+    "allow_short": false,
+    "sl_atr": 4.0,
+    "trail_dist_atr": 5.0,
+    "short_tp_atr": 5.0,
+    "max_leverage": 1.8,
+    "risk_per_trade": 0.025,
+    "target_annual_vol": 0.28
+  },
+  "oos_5yr_summary": {
+    "total_return": 0.1651010955241623,
+    "cagr": 0.031891856557762166,
+    "sharpe": 0.3990956955636436,
+    "calmar": 0.2929592584996901,
+    "max_dd": 0.10886106389361953,
+    "win_rate": 0.46808510638297873,
+    "profit_factor": 1.3913124368957421,
+    "n_trades": 47,
+    "daily_n": 1749,
+    "daily_skew": 1.3168529365978094,
+    "daily_kurt": 23.877185829469852
+  }
+}
